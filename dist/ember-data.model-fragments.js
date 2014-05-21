@@ -58,11 +58,77 @@ var define, requireModule, require, requirejs;
   };
 })();
 
-define("fragments/array/fragment", 
-  ["./primitive","exports"],
-  function(__dependency1__, __exports__) {
+define("core-model",
+  ["ember","./model","exports"],
+  function(__dependency1__, __dependency2__, __exports__) {
     "use strict";
-    var PrimitiveArray = __dependency1__["default"];
+    var Ember = __dependency1__["default"];
+    var Model = __dependency2__["default"];
+
+    // Ember object prototypes are lazy-loaded
+    Model.proto();
+
+    // TODO: is it easier to extend from DS.Model and disable functionality than to
+    // cherry-pick common functionality?
+    var protoProps = [
+      '_setup',
+      '_unhandledEvent',
+      'send',
+      'transitionTo',
+      'data',
+      'isEmpty',
+      'isLoading',
+      'isLoaded',
+      'isDirty',
+      'isSaving',
+      'isDeleted',
+      'isNew',
+      'isValid',
+      'serialize',
+      'changedAttributes',
+      'eachAttribute',
+      'fragmentDidDirty',
+      'fragmentDidReset',
+      'rollbackFragments'
+    ].reduce(function(props, name) {
+      props[name] = Model.prototype[name] || Ember.meta(Model.prototype).descs[name];
+      return props;
+    }, {});
+
+    var classProps = [
+      'attributes',
+      'eachAttribute',
+      'transformedAttributes',
+      'eachTransformedAttribute'
+    ].reduce(function(props, name) {
+      props[name] = Model[name] || Ember.meta(Model).descs[name];
+      return props;
+    }, {});
+
+    // CoreModel is a base model class that has state management, but no relation or persistence logic
+    var CoreModel = Ember.Object.extend(protoProps, {
+      eachRelationship: Ember.K,
+      updateRecordArraysLater: Ember.K
+    });
+
+    CoreModel.reopenClass(classProps, {
+      eachRelationship: Ember.K
+    });
+
+    __exports__["default"] = CoreModel;
+  });
+define("ember",
+  ["exports"],
+  function(__exports__) {
+    "use strict";
+    __exports__["default"] = Ember;
+  });
+define("fragments/array/fragment",
+  ["ember","./primitive","exports"],
+  function(__dependency1__, __dependency2__, __exports__) {
+    "use strict";
+    var Ember = __dependency1__["default"];
+    var PrimitiveArray = __dependency2__["default"];
 
     var get = Ember.get;
     var map = Ember.EnumerableUtils.map;
@@ -103,9 +169,16 @@ define("fragments/array/fragment",
         this._super(data);
       },
 
+      adapterDidCommit: function() {
+        this._super();
+
+        // Notify all records of commit
+        this.invoke('adapterDidCommit');
+      },
+
       isDirty: function() {
         return this._super() || this.isAny('isDirty');
-      }.property('@each.isDirty'),
+      }.property('@each.isDirty', '_originalState'),
 
       rollback: function() {
         this._super();
@@ -146,11 +219,11 @@ define("fragments/array/fragment",
       },
 
       addFragment: function(fragment) {
-        return get(this, 'content').addObject(fragment);
+        return this.addObject(fragment);
       },
 
       removeFragment: function(fragment) {
-        return get(this, 'content').removeObject(fragment);
+        return this.removeObject(fragment);
       },
 
       createFragment: function(props) {
@@ -165,11 +238,14 @@ define("fragments/array/fragment",
 
     __exports__["default"] = FragmentArray;
   });
-define("fragments/array/primitive", 
-  ["exports"],
-  function(__exports__) {
+define("fragments/array/primitive",
+  ["ember","exports"],
+  function(__dependency1__, __exports__) {
     "use strict";
+    var Ember = __dependency1__["default"];
+
     var get = Ember.get;
+    var set = Ember.set;
     var splice = Array.prototype.splice;
 
     //
@@ -183,7 +259,7 @@ define("fragments/array/primitive",
 
       init: function() {
         this._super();
-        this.originalState = [];
+        set(this, '_originalState', []);
       },
 
       content: function() {
@@ -194,18 +270,24 @@ define("fragments/array/primitive",
       setupData: function(data) {
         var content = get(this, 'content');
 
-        data = this.originalState = Ember.makeArray(data);
+        data = Ember.makeArray(data);
+        set(this, '_originalState', data);
 
         // Use non-KVO mutator to prevent parent record from dirtying
         splice.apply(content, [ 0, content.length ].concat(data));
       },
 
+      adapterDidCommit: function() {
+        // Fragment array has been persisted; use the current state as the original state
+        set(this, '_originalState', this.toArray());
+      },
+
       isDirty: function() {
-        return Ember.compare(this.toArray(), this.originalState) !== 0;
-      }.property('[]'),
+        return Ember.compare(this.toArray(), get(this, '_originalState')) !== 0;
+      }.property('[]', '_originalState'),
 
       rollback: function() {
-        this.setObjects(this.originalState);
+        this.setObjects(get(this, '_originalState'));
       },
 
       serialize: function() {
@@ -233,12 +315,13 @@ define("fragments/array/primitive",
 
     __exports__["default"] = PrimitiveArray;
   });
-define("fragments/attributes", 
-  ["./array/primitive","./array/fragment","exports"],
-  function(__dependency1__, __dependency2__, __exports__) {
+define("fragments/attributes",
+  ["ember","./array/primitive","./array/fragment","exports"],
+  function(__dependency1__, __dependency2__, __dependency3__, __exports__) {
     "use strict";
-    var PrimitiveArray = __dependency1__["default"];
-    var FragmentArray = __dependency2__["default"];
+    var Ember = __dependency1__["default"];
+    var PrimitiveArray = __dependency2__["default"];
+    var FragmentArray = __dependency3__["default"];
 
     var get = Ember.get;
 
@@ -255,28 +338,30 @@ define("fragments/attributes",
       };
 
       return Ember.computed(function(key, value) {
-        var data = this._data[key] || getDefaultValue(this, options, 'array');
+        var record = this;
+        var data = this._data[key] || getDefaultValue(this, options, 'object');
         var fragment = this._fragments[key];
 
+        function setOwner(fragment) {
+          return fragment.setProperties({
+            _owner : record,
+            _name  : key
+          });
+        }
+
         if (data && data !== fragment) {
-          if (!fragment) {
-            fragment = this.store.buildFragment(type);
-
-            // Set the correct owner/name on the fragment
-            fragment.setProperties({
-              _owner : this,
-              _name  : key
-            });
-          }
-
+          fragment || (fragment = setOwner(this.store.buildFragment(type)));
           fragment.setupData(data);
           this._data[key] = fragment;
+        } else {
+          // Handle the adapter setting the fragment to null
+          fragment = data;
         }
 
         if (arguments.length > 1) {
-          Ember.assert("You can only assign a '" + type + "' fragment to this property", value instanceof this.store.modelFor(type));
+          Ember.assert("You can only assign a '" + type + "' fragment to this property", value === null || value instanceof this.store.modelFor(type));
 
-          fragment = value;
+          fragment = value ? setOwner(value) : null;
 
           if (this._data[key] !== fragment) {
             this.fragmentDidDirty(key, fragment);
@@ -328,6 +413,9 @@ define("fragments/attributes",
           fragments || (fragments = createArray());
           fragments.setupData(data);
           this._data[key] = fragments;
+        } else {
+          // Handle the adapter setting the fragment array to null
+          fragments = data;
         }
 
         if (arguments.length > 1) {
@@ -380,20 +468,16 @@ define("fragments/attributes",
     __exports__.hasManyFragments = hasManyFragments;
     __exports__.fragmentOwner = fragmentOwner;
   });
-define("fragments/model", 
-  ["../store","../model","./states","exports"],
-  function(__dependency1__, __dependency2__, __dependency3__, __exports__) {
+define("fragments/ext",
+  ["../store","../model","exports"],
+  function(__dependency1__, __dependency2__, __exports__) {
     "use strict";
     var Store = __dependency1__["default"];
     var Model = __dependency2__["default"];
-    var FragmentRootState = __dependency3__["default"];
 
     var get = Ember.get;
 
-    //
-    // Fragment Creation
-    //
-
+    // Add fragment creation methods to the store
     Store.reopen({
       // Create a fragment with injections applied that starts
       // in the 'empty' state
@@ -419,12 +503,9 @@ define("fragments/model",
       }
     });
 
-    //
     // Add fragment support to `DS.Model`
     // TODO: handle the case where there's no response to a commit, and
     // in-flight attributes just get merged
-    //
-
     Model.reopen({
       _setup: function() {
         this._super();
@@ -442,12 +523,38 @@ define("fragments/model",
 
           // The data may have updated, but not changed at all, in which case
           // treat the update as a rollback
-          if (fragment && fragment !== record._data[key]) {
+          if (fragment && record._data[key] && fragment !== record._data[key]) {
             fragment.setupData(record._data[key]);
             record._data[key] = fragment;
           }
         }
       }),
+
+      adapterDidCommit: function(data) {
+        this._super.apply(this, arguments);
+
+        // Notify fragments that the record was committed
+        for (var key in this._fragments) {
+          this._fragments[key].adapterDidCommit();
+        }
+      },
+
+      changedAttributes: function() {
+        var diffData = this._super();
+        var fragment;
+
+        for (var key in this._fragments) {
+          fragment = this._fragments[key];
+
+          // An actual diff of the fragment or fragment array is outside the scope
+          // of this method, so just indicate that there is a change instead
+          if (get(fragment, 'isDirty')) {
+            diffData[key] = true;
+          }
+        }
+
+        return diffData;
+      },
 
       rollback: function() {
         this._super();
@@ -491,11 +598,19 @@ define("fragments/model",
       }
     });
 
-    //
-    // Model Fragment
-    //
+    __exports__["default"] = Model;
+  });
+define("fragments/model",
+  ["ember","../core-model","./states","exports"],
+  function(__dependency1__, __dependency2__, __dependency3__, __exports__) {
+    "use strict";
+    var Ember = __dependency1__["default"];
+    var CoreModel = __dependency2__["default"];
+    var FragmentRootState = __dependency3__["default"];
 
-    var ModelFragment = Ember.Object.extend(Ember.Comparable, Ember.Copyable, {
+    var get = Ember.get;
+
+    var ModelFragment = CoreModel.extend(Ember.Comparable, Ember.Copyable, {
       _name: null,
 
       _owner: null,
@@ -551,6 +666,16 @@ define("fragments/model",
         return this.store.createFragment(type, data);
       },
 
+      adapterDidCommit: function() {
+        // Merge in-flight attributes if any
+        if (Ember.keys(this._inFlightAttributes).length) {
+          Ember.mixin(this._data, this._inFlightAttributes);
+          this._inFlightAttributes = {};
+        }
+
+        this.transitionTo('saved');
+      },
+
       toStringExtension: function() {
         return 'owner(' + get(this, '_owner.id') + ')';
       },
@@ -561,69 +686,14 @@ define("fragments/model",
       }
     });
 
-    //
-    // Borrow functionality from DS.Model
-    // TODO: is it easier to extend from DS.Model and disable functionality than to
-    // cherry-pick common functionality?
-    //
-
-    // Ember object prototypes are lazy-loaded
-    Model.proto();
-
-    var protoPropNames = [
-      '_setup',
-      '_unhandledEvent',
-      'send',
-      'transitionTo',
-      'data',
-      'isEmpty',
-      'isLoading',
-      'isLoaded',
-      'isDirty',
-      'isSaving',
-      'isDeleted',
-      'isNew',
-      'isValid',
-      'serialize',
-      'eachAttribute',
-      'fragmentDidDirty',
-      'fragmentDidReset',
-      'rollbackFragments'
-    ];
-
-    var protoProps = protoPropNames.reduce(function(props, name) {
-      props[name] = Model.prototype[name] || Ember.meta(Model.prototype).descs[name];
-      return props;
-    }, {});
-
-    ModelFragment.reopen(protoProps, {
-      eachRelationship: Ember.K,
-      updateRecordArraysLater: Ember.K
-    });
-
-    var classPropNames = [
-      'attributes',
-      'eachAttribute',
-      'transformedAttributes',
-      'eachTransformedAttribute'
-    ];
-
-    var classProps = classPropNames.reduce(function(props, name) {
-      props[name] = Model[name] || Ember.meta(Model).descs[name];
-      return props;
-    }, {});
-
-    ModelFragment.reopenClass(classProps, {
-      eachRelationship: Ember.K
-    });
-
     __exports__["default"] = ModelFragment;
   });
-define("fragments/states", 
-  ["../states","exports"],
-  function(__dependency1__, __exports__) {
+define("fragments/states",
+  ["ember","../states","exports"],
+  function(__dependency1__, __dependency2__, __exports__) {
     "use strict";
-    var RootState = __dependency1__["default"];
+    var Ember = __dependency1__["default"];
+    var RootState = __dependency2__["default"];
 
     var get = Ember.get;
 
@@ -751,7 +821,7 @@ define("fragments/states",
 
     __exports__["default"] = FragmentRootState;
   });
-define("fragments/transform", 
+define("fragments/transform",
   ["../transform","exports"],
   function(__dependency1__, __exports__) {
     "use strict";
@@ -776,7 +846,7 @@ define("fragments/transform",
 
     __exports__["default"] = FragmentTransform;
   });
-define("initializers", 
+define("initializers",
   ["./fragments/transform","exports"],
   function(__dependency1__, __exports__) {
     "use strict";
@@ -795,17 +865,19 @@ define("initializers",
 
     __exports__["default"] = initializers;
   });
-define("main", 
-  ["./fragments/model","./fragments/array/fragment","./fragments/transform","./fragments/attributes","./initializers","exports"],
-  function(__dependency1__, __dependency2__, __dependency3__, __dependency4__, __dependency5__, __exports__) {
+define("main",
+  ["ember","./fragments/ext","./fragments/model","./fragments/array/fragment","./fragments/transform","./fragments/attributes","./initializers","exports"],
+  function(__dependency1__, __dependency2__, __dependency3__, __dependency4__, __dependency5__, __dependency6__, __dependency7__, __exports__) {
     "use strict";
-    var ModelFragment = __dependency1__["default"];
-    var FragmentArray = __dependency2__["default"];
-    var FragmentTransform = __dependency3__["default"];
-    var hasOneFragment = __dependency4__.hasOneFragment;
-    var hasManyFragments = __dependency4__.hasManyFragments;
-    var fragmentOwner = __dependency4__.fragmentOwner;
-    var initializers = __dependency5__["default"];
+    var Ember = __dependency1__["default"];
+    var ext = __dependency2__["default"];
+    var ModelFragment = __dependency3__["default"];
+    var FragmentArray = __dependency4__["default"];
+    var FragmentTransform = __dependency5__["default"];
+    var hasOneFragment = __dependency6__.hasOneFragment;
+    var hasManyFragments = __dependency6__.hasManyFragments;
+    var fragmentOwner = __dependency6__.fragmentOwner;
+    var initializers = __dependency7__["default"];
 
     DS.ModelFragment = ModelFragment;
     DS.FragmentArray = FragmentArray;
@@ -825,25 +897,25 @@ define("main",
     // Something must be exported...
     __exports__["default"] = DS;
   });
-define("model", 
+define("model",
   ["exports"],
   function(__exports__) {
     "use strict";
     __exports__["default"] = DS.Model;
   });
-define("states", 
+define("states",
   ["exports"],
   function(__exports__) {
     "use strict";
     __exports__["default"] = DS.RootState;
   });
-define("store", 
+define("store",
   ["exports"],
   function(__exports__) {
     "use strict";
     __exports__["default"] = DS.Store;
   });
-define("transform", 
+define("transform",
   ["exports"],
   function(__exports__) {
     "use strict";
